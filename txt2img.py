@@ -31,10 +31,14 @@ def load_model_from_config(config, ckpt, device=torch.device("cuda"), verbose=Fa
     start = time.time()
     
     pl_sd = torch.load(ckpt, map_location="cuda")
-    # cast all tensors to float16
-    for k in pl_sd["state_dict"]:
-        if isinstance(pl_sd["state_dict"][k], torch.Tensor):
-            pl_sd["state_dict"][k] = pl_sd["state_dict"][k].half()
+    # # cast all tensors to float16
+    # for k in pl_sd["state_dict"]:
+    #     if isinstance(pl_sd["state_dict"][k], torch.Tensor):
+    #         pl_sd["state_dict"][k] = pl_sd["state_dict"][k].half()
+
+    # # add _16 to the base filename in ckpt
+    # ckpt = os.path.splitext(ckpt)[0] + "_16" + os.path.splitext(ckpt)[1]
+    # torch.save(pl_sd, ckpt)
 
     # print time to load file
     print(f"Loaded model in {time.time() - start:.2f} seconds")
@@ -166,7 +170,7 @@ def parse_args():
     parser.add_argument(
         "--ckpt",
         type=str,
-        default="checkpoints/v1-5-pruned-emaonly.ckpt",
+        default="checkpoints/v1-5-pruned-emaonly_16.ckpt",
         help="path to checkpoint of model",
     )
     parser.add_argument(

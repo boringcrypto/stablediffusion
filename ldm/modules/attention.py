@@ -6,7 +6,9 @@ from torch import nn, einsum
 from einops import rearrange, repeat
 from typing import Optional, Any
 
-from ldm.modules.diffusionmodules.util import checkpoint
+from ldm.modules.diffusionmodules.util import checkpoint, dict_key
+from ldm.torch.conv import Conv2d
+from ldm.torch.linear import Linear
 
 
 try:
@@ -57,12 +59,12 @@ class GEGLU(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0., device=None):
+    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0., device=None, state_dict=None):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = default(dim_out, dim)
         project_in = nn.Sequential(
-            nn.Linear(dim, inner_dim, device=device),
+            Linear(dim, inner_dim, device=device),
             nn.GELU()
         ) if not glu else GEGLU(dim, inner_dim, device=device)
 
@@ -247,7 +249,7 @@ class BasicTransformerBlock(nn.Module):
         "softmax-xformers": MemoryEfficientCrossAttention
     }
     def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True,
-                 disable_self_attn=False, device=None):
+                 disable_self_attn=False, device=None, state_dict=None):
         super().__init__()
         attn_mode = "softmax-xformers" if XFORMERS_IS_AVAILBLE else "softmax"
         assert attn_mode in self.ATTENTION_MODES
@@ -287,7 +289,8 @@ class SpatialTransformer(nn.Module):
                  depth=1, dropout=0., context_dim=None,
                  disable_self_attn=False, use_linear=False,
                  use_checkpoint=True,
-                 device=None):
+                 device=None,
+                 state_dict=None):
         super().__init__()
         if exists(context_dim) and not isinstance(context_dim, list):
             context_dim = [context_dim]
@@ -295,14 +298,15 @@ class SpatialTransformer(nn.Module):
         inner_dim = n_heads * d_head
         self.norm = Normalize(in_channels, device)
         if not use_linear:
-            self.proj_in = nn.Conv2d(in_channels,
+            self.proj_in = Conv2d(in_channels,
                                      inner_dim,
                                      kernel_size=1,
                                      stride=1,
                                      padding=0,
-                                     device=device)
+                                     device=device,
+                                     tensors=dict_key(state_dict, "proj_in."))
         else:
-            self.proj_in = nn.Linear(in_channels, inner_dim, device=device)
+            self.proj_in = Linear(in_channels, inner_dim, device=device, tensors=dict_key(state_dict, "proj_in."))
 
         self.transformer_blocks = nn.ModuleList(
             [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim[d],
@@ -310,14 +314,15 @@ class SpatialTransformer(nn.Module):
                 for d in range(depth)]
         )
         if not use_linear:
-            self.proj_out = zero_module(nn.Conv2d(inner_dim,
+            self.proj_out = zero_module(Conv2d(inner_dim,
                                                   in_channels,
                                                   kernel_size=1,
                                                   stride=1,
                                                   padding=0,
-                                                  device=device))
+                                                  device=device,
+                                                  tensors=dict_key(state_dict, "proj_out.")))
         else:
-            self.proj_out = zero_module(nn.Linear(in_channels, inner_dim, device=device))
+            self.proj_out = zero_module(Linear(in_channels, inner_dim, device=device, tensors=dict_key(state_dict, "proj_out.")))
         self.use_linear = use_linear
 
     def forward(self, x, context=None):

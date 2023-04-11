@@ -14,6 +14,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 from einops import repeat
+from ldm.torch.conv import Conv2d
+from ldm.torch.linear import Linear
+from ldm.torch.normalization import GroupNorm
 
 from ldm.util import instantiate_from_config
 
@@ -206,13 +209,13 @@ def mean_flat(tensor):
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
 
-def normalization(channels, device=None):
+def normalization(channels, device=None, tensors=None):
     """
     Make a standard normalization layer.
     :param channels: number of input channels.
     :return: an nn.Module for normalization.
     """
-    return GroupNorm32(32, channels, device=device)
+    return GroupNorm32(32, channels, device=device, tensors=tensors)
 
 
 # PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
@@ -221,7 +224,7 @@ class SiLU(nn.Module):
         return x * torch.sigmoid(x)
 
 
-class GroupNorm32(nn.GroupNorm):
+class GroupNorm32(GroupNorm):
     def forward(self, x):
         return super().forward(x.to(self.weight.dtype))
 
@@ -233,7 +236,7 @@ def conv_nd(dims, *args, **kwargs):
     if dims == 1:
         return nn.Conv1d(*args, **kwargs)
     elif dims == 2:
-        return nn.Conv2d(*args, **kwargs)
+        return Conv2d(*args, **kwargs)
     elif dims == 3:
         return nn.Conv3d(*args, **kwargs)
     raise ValueError(f"unsupported dimensions: {dims}")
@@ -243,7 +246,7 @@ def linear(*args, **kwargs):
     """
     Create a linear module.
     """
-    return nn.Linear(*args, **kwargs)
+    return Linear(*args, **kwargs)
 
 
 def avg_pool_nd(dims, *args, **kwargs):

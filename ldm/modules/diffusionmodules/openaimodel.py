@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from ldm.modules.diffusionmodules.util import (
     checkpoint,
     conv_nd,
+    dict_key,
     linear,
     avg_pool_nd,
     zero_module,
@@ -96,14 +97,14 @@ class Upsample(nn.Module):
                  upsampling occurs in the inner-two dimensions.
     """
 
-    def __init__(self, channels, use_conv, dims=2, out_channels=None, padding=1, device=None):
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, padding=1, device=None, state_dict=None):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
         self.use_conv = use_conv
         self.dims = dims
         if use_conv:
-            self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=padding, device=device)
+            self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=padding, device=device, tensors=dict_key(state_dict, "conv."))
 
     def forward(self, x):
         assert x.shape[1] == self.channels
@@ -139,7 +140,7 @@ class Downsample(nn.Module):
                  downsampling occurs in the inner-two dimensions.
     """
 
-    def __init__(self, channels, use_conv, dims=2, out_channels=None, padding=1, device=None):
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, padding=1, device=None, state_dict=None):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
@@ -148,7 +149,7 @@ class Downsample(nn.Module):
         stride = 2 if dims != 3 else (1, 2, 2)
         if use_conv:
             self.op = conv_nd(
-                dims, self.channels, self.out_channels, 3, stride=stride, padding=padding, device=device
+                dims, self.channels, self.out_channels, 3, stride=stride, padding=padding, device=device, tensors=dict_key(state_dict, "op.")
             )
         else:
             assert self.channels == self.out_channels
@@ -187,7 +188,8 @@ class ResBlock(TimestepBlock):
         use_checkpoint=False,
         up=False,
         down=False,
-        device=None
+        device=None,
+        state_dict=None
     ):
         super().__init__()
         self.channels = channels
@@ -199,9 +201,9 @@ class ResBlock(TimestepBlock):
         self.use_scale_shift_norm = use_scale_shift_norm
 
         self.in_layers = nn.Sequential(
-            normalization(channels, device),
+            normalization(channels, device, tensors=dict_key(state_dict, 'in_layers.0.')),
             nn.SiLU(),
-            conv_nd(dims, channels, self.out_channels, 3, padding=1, device=device),
+            conv_nd(dims, channels, self.out_channels, 3, padding=1, device=device, tensors=dict_key(state_dict, 'in_layers.2.')),
         )
 
         self.updown = up or down
@@ -220,15 +222,16 @@ class ResBlock(TimestepBlock):
             linear(
                 emb_channels,
                 2 * self.out_channels if use_scale_shift_norm else self.out_channels,
-                device=device
+                device=device,
+                tensors=dict_key(state_dict, 'emb_layers.1.')
             ),
         )
         self.out_layers = nn.Sequential(
-            normalization(self.out_channels, device),
+            normalization(self.out_channels, device, tensors=dict_key(state_dict, 'out_layers.0.')),
             nn.SiLU(),
             nn.Dropout(p=dropout),
             zero_module(
-                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1, device=device)
+                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1, device=device, tensors=dict_key(state_dict, 'out_layers.3.'))
             ),
         )
 
@@ -236,10 +239,10 @@ class ResBlock(TimestepBlock):
             self.skip_connection = nn.Identity()
         elif use_conv:
             self.skip_connection = conv_nd(
-                dims, channels, self.out_channels, 3, padding=1, device=device
+                dims, channels, self.out_channels, 3, padding=1, device=device, tensors=dict_key(state_dict, 'skip_connection.')
             )
         else:
-            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1, device=device)
+            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1, device=device, tensors=dict_key(state_dict, 'skip_connection.'))
 
     def forward(self, x, emb):
         """
@@ -544,9 +547,9 @@ class UNetModel(nn.Module):
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
-            linear(model_channels, time_embed_dim, device=device),
+            linear(model_channels, time_embed_dim, device=device, tensors=dict_key(state_dict, 'time_embed.0.')),
             nn.SiLU(),
-            linear(time_embed_dim, time_embed_dim, device=device),
+            linear(time_embed_dim, time_embed_dim, device=device, tensors=dict_key(state_dict, 'time_embed.2.')),
         )
 
         if self.num_classes is not None:
@@ -570,7 +573,7 @@ class UNetModel(nn.Module):
         self.input_blocks = nn.ModuleList(
             [
                 TimestepEmbedSequential(
-                    conv_nd(dims, in_channels, model_channels, 3, padding=1, device=device)
+                    conv_nd(dims, in_channels, model_channels, 3, padding=1, device=device, tensors=dict_key(state_dict, f"input_blocks.0.0.")),
                 )
             ]
         )
@@ -580,7 +583,8 @@ class UNetModel(nn.Module):
         ds = 1
         for level, mult in enumerate(channel_mult):
             for nr in range(self.num_res_blocks[level]):
-                layers = [
+                layers = []
+                layers.append(
                     ResBlock(
                         ch,
                         time_embed_dim,
@@ -589,9 +593,10 @@ class UNetModel(nn.Module):
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
-                        device=device
+                        device=device,
+                        state_dict=dict_key(state_dict, f"input_blocks.{len(self.input_blocks)}.{len(layers)}.")
                     )
-                ]
+                )
                 ch = mult * model_channels
                 if ds in attention_resolutions:
                     if num_head_channels == -1:
@@ -620,7 +625,7 @@ class UNetModel(nn.Module):
                                 ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
                                 disable_self_attn=disabled_sa, use_linear=use_linear_in_transformer,
                                 use_checkpoint=use_checkpoint,
-                                device=device
+                                device=device, state_dict=dict_key(state_dict, f"input_blocks.{len(self.input_blocks)}.{len(layers)}.")
                             )
                         )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -643,7 +648,7 @@ class UNetModel(nn.Module):
                         )
                         if resblock_updown
                         else Downsample(
-                            ch, conv_resample, dims=dims, out_channels=out_ch, device=device
+                            ch, conv_resample, dims=dims, out_channels=out_ch, device=device, state_dict=dict_key(state_dict, f"input_blocks.{len(self.input_blocks)}.0.")
                         )
                     )
                 )
@@ -668,7 +673,8 @@ class UNetModel(nn.Module):
                 dims=dims,
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
-                device=device
+                device=device,
+                state_dict=dict_key(state_dict, f"middle_block.0.")
             ),
             AttentionBlock(
                 ch,
@@ -681,7 +687,7 @@ class UNetModel(nn.Module):
                             ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
                             disable_self_attn=disable_middle_self_attn, use_linear=use_linear_in_transformer,
                             use_checkpoint=use_checkpoint,
-                            device=device
+                            device=device, state_dict=dict_key(state_dict, f"middle_block.1.")
                         ),
             ResBlock(
                 ch,
@@ -690,7 +696,8 @@ class UNetModel(nn.Module):
                 dims=dims,
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
-                device=device
+                device=device,
+                state_dict=dict_key(state_dict, f"middle_block.2.")
             ),
         )
         self._feature_size += ch
@@ -699,7 +706,8 @@ class UNetModel(nn.Module):
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(self.num_res_blocks[level] + 1):
                 ich = input_block_chans.pop()
-                layers = [
+                layers = []
+                layers.append(
                     ResBlock(
                         ch + ich,
                         time_embed_dim,
@@ -708,9 +716,10 @@ class UNetModel(nn.Module):
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
-                        device=device
+                        device=device,
+                        state_dict=dict_key(state_dict, f"output_blocks.{len(self.output_blocks)}.{len(layers)}.")
                     )
-                ]
+                )
                 ch = model_channels * mult
                 if ds in attention_resolutions:
                     if num_head_channels == -1:
@@ -739,7 +748,7 @@ class UNetModel(nn.Module):
                                 ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
                                 disable_self_attn=disabled_sa, use_linear=use_linear_in_transformer,
                                 use_checkpoint=use_checkpoint,
-                                device=device
+                                device=device, state_dict=dict_key(state_dict, f"output_blocks.{len(self.output_blocks)}.{len(layers)}.")
                             )
                         )
                 if level and i == self.num_res_blocks[level]:
@@ -754,19 +763,20 @@ class UNetModel(nn.Module):
                             use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
                             up=True,
-                            device=device
+                            device=device,
+                            state_dict=dict_key(state_dict, f"output_blocks.{len(self.output_blocks)}.{len(layers)}.")
                         )
                         if resblock_updown
-                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch, device=device)
+                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch, device=device, state_dict=dict_key(state_dict, f"output_blocks.{len(self.output_blocks)}.{len(layers)}."))
                     )
                     ds //= 2
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
 
         self.out = nn.Sequential(
-            normalization(ch, device),
+            normalization(ch, device, tensors=dict_key(state_dict, "out.0.")),
             nn.SiLU(),
-            zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1, device=device)),
+            zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1, device=device, tensors=dict_key(state_dict, "out.2."))),
         )
         if self.predict_codebook_ids:
             self.id_predictor = nn.Sequential(

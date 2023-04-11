@@ -28,7 +28,6 @@ class AutoencoderKL(pl.LightningModule):
                  state_dict=None
                  ):
         super().__init__()
-        print(state_dict)
         self.learn_logvar = learn_logvar
         self.image_key = image_key
         self.encoder = Encoder(**ddconfig, device=device, state_dict=dict_key(state_dict, "encoder."))
