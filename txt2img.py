@@ -1,4 +1,5 @@
 import argparse, os
+import time
 import cv2
 import torch
 import numpy as np
@@ -11,7 +12,6 @@ from torchvision.utils import make_grid
 from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import nullcontext
-from imwatermark import WatermarkEncoder
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -27,12 +27,29 @@ def chunk(it, size):
 
 def load_model_from_config(config, ckpt, device=torch.device("cuda"), verbose=False):
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
+    # start timer
+    start = time.time()
+    
+    pl_sd = torch.load(ckpt, map_location="cuda")
+    # cast all tensors to float16
+    for k in pl_sd["state_dict"]:
+        if isinstance(pl_sd["state_dict"][k], torch.Tensor):
+            pl_sd["state_dict"][k] = pl_sd["state_dict"][k].half()
+
+    # print time to load file
+    print(f"Loaded model in {time.time() - start:.2f} seconds")
+
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
     sd = pl_sd["state_dict"]
-    model = instantiate_from_config(config.model)
+    model = instantiate_from_config(config.model, device, sd)
+    # print time to instantiate model
+    print(f"Instantiated model in {time.time() - start:.2f} seconds")
+
     m, u = model.load_state_dict(sd, strict=False)
+    # print time to load state dict
+    print(f"Loaded state dict in {time.time() - start:.2f} seconds")
+    
     if len(m) > 0 and verbose:
         print("missing keys:")
         print(m)
@@ -40,13 +57,6 @@ def load_model_from_config(config, ckpt, device=torch.device("cuda"), verbose=Fa
         print("unexpected keys:")
         print(u)
 
-    if device == torch.device("cuda"):
-        model.cuda()
-    elif device == torch.device("cpu"):
-        model.cpu()
-        model.cond_stage_model.device = "cpu"
-    else:
-        raise ValueError(f"Incorrect device name. Received: {device}")
     model.eval()
     return model
 
@@ -97,7 +107,7 @@ def parse_args():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=3,
+        default=1,
         help="sample this often",
     )
     parser.add_argument(
@@ -127,7 +137,7 @@ def parse_args():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=3,
+        default=1,
         help="how many samples to produce for each given prompt. A.k.a batch size",
     )
     parser.add_argument(
@@ -150,12 +160,13 @@ def parse_args():
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/stable-diffusion/v2-inference.yaml",
+        default="configs/stable-diffusion/v1-inference.yaml",
         help="path to config which constructs model",
     )
     parser.add_argument(
         "--ckpt",
         type=str,
+        default="checkpoints/v1-5-pruned-emaonly.ckpt",
         help="path to checkpoint of model",
     )
     parser.add_argument(
@@ -182,7 +193,7 @@ def parse_args():
         type=str,
         help="Device on which Stable Diffusion will be run",
         choices=["cpu", "cuda"],
-        default="cpu"
+        default="cuda"
     )
     parser.add_argument(
         "--torchscript",
@@ -203,20 +214,19 @@ def parse_args():
     return opt
 
 
-def put_watermark(img, wm_encoder=None):
-    if wm_encoder is not None:
-        img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        img = wm_encoder.encode(img, 'dwtDct')
-        img = Image.fromarray(img[:, :, ::-1])
-    return img
-
-
 def main(opt):
+    # Start a timer
+    start_time = time.time()
+    print("Start timer")
+    
     seed_everything(opt.seed)
 
     config = OmegaConf.load(f"{opt.config}")
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
     model = load_model_from_config(config, f"{opt.ckpt}", device)
+    model.half()
+    # print time elapsed for loading model
+    print(f"Model loaded in {time.time() - start_time:.2f} seconds")
 
     if opt.plms:
         sampler = PLMSSampler(model, device=device)
@@ -228,25 +238,7 @@ def main(opt):
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
 
-    print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
-    wm = "SDV2"
-    wm_encoder = WatermarkEncoder()
-    wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
-
     batch_size = opt.n_samples
-    n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-    if not opt.from_file:
-        prompt = opt.prompt
-        assert prompt is not None
-        data = [batch_size * [prompt]]
-
-    else:
-        print(f"reading prompts from {opt.from_file}")
-        with open(opt.from_file, "r") as f:
-            data = f.read().splitlines()
-            data = [p for p in data for i in range(opt.repeat)]
-            data = list(chunk(data, batch_size))
-
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
     sample_count = 0
@@ -255,7 +247,7 @@ def main(opt):
 
     start_code = None
     if opt.fixed_code:
-        start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
+        start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device, dtype=torch.float16)
 
     if opt.torchscript or opt.ipex:
         transformer = model.cond_stage_model.model
@@ -330,57 +322,35 @@ def main(opt):
             for _ in range(3):
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
 
-    precision_scope = autocast if opt.precision=="autocast" or opt.bf16 else nullcontext
     with torch.no_grad(), \
-        precision_scope(opt.device), \
         model.ema_scope():
-            all_samples = list()
-            for n in trange(opt.n_iter, desc="Sampling"):
-                for prompts in tqdm(data, desc="data"):
-                    uc = None
-                    if opt.scale != 1.0:
-                        uc = model.get_learned_conditioning(batch_size * [""])
-                    if isinstance(prompts, tuple):
-                        prompts = list(prompts)
-                    c = model.get_learned_conditioning(prompts)
-                    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                    samples, _ = sampler.sample(S=opt.steps,
-                                                     conditioning=c,
-                                                     batch_size=opt.n_samples,
-                                                     shape=shape,
-                                                     verbose=False,
-                                                     unconditional_guidance_scale=opt.scale,
-                                                     unconditional_conditioning=uc,
-                                                     eta=opt.ddim_eta,
-                                                     x_T=start_code)
+            uc = None
+            if opt.scale != 1.0:
+                uc = model.get_learned_conditioning(batch_size * [""])
+            c = model.get_learned_conditioning(batch_size * [opt.prompt])
+            shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+            samples, _ = sampler.sample(S=opt.steps,
+                                        conditioning=c,
+                                        batch_size=opt.n_samples,
+                                        shape=shape,
+                                        verbose=False,
+                                        unconditional_guidance_scale=opt.scale,
+                                        unconditional_conditioning=uc,
+                                        eta=opt.ddim_eta,
+                                        x_T=start_code)
 
-                    x_samples = model.decode_first_stage(samples)
-                    x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+            x_samples = model.decode_first_stage(samples)
+            x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
 
-                    for x_sample in x_samples:
-                        x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                        img = Image.fromarray(x_sample.astype(np.uint8))
-                        img = put_watermark(img, wm_encoder)
-                        img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                        base_count += 1
-                        sample_count += 1
+            for x_sample in x_samples:
+                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                img = Image.fromarray(x_sample.astype(np.uint8))
+                img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                base_count += 1
+                sample_count += 1
 
-                    all_samples.append(x_samples)
-
-            # additionally, save as grid
-            grid = torch.stack(all_samples, 0)
-            grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-            grid = make_grid(grid, nrow=n_rows)
-
-            # to image
-            grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-            grid = Image.fromarray(grid.astype(np.uint8))
-            grid = put_watermark(grid, wm_encoder)
-            grid.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-            grid_count += 1
-
-    print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
-          f" \nEnjoy.")
+    # print time elapsed
+    print(f"Time elapsed: {time.time() - start_time}")
 
 
 if __name__ == "__main__":

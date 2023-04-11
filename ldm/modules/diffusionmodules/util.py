@@ -206,13 +206,13 @@ def mean_flat(tensor):
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
 
-def normalization(channels):
+def normalization(channels, device=None):
     """
     Make a standard normalization layer.
     :param channels: number of input channels.
     :return: an nn.Module for normalization.
     """
-    return GroupNorm32(32, channels)
+    return GroupNorm32(32, channels, device=device)
 
 
 # PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
@@ -223,7 +223,7 @@ class SiLU(nn.Module):
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
+        return super().forward(x.to(self.weight.dtype))
 
 
 def conv_nd(dims, *args, **kwargs):
@@ -276,3 +276,10 @@ def noise_like(shape, device, repeat=False):
     repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
     noise = lambda: torch.randn(shape, device=device)
     return repeat_noise() if repeat else noise()
+
+
+def dict_key(state_dict, key):
+    if (state_dict is None) or (key is None):
+        return None
+    # return all keys:value pairs that start with the given key (e.g. 'module.') and remove the prefix from the key
+    return {k[len(key):]: v for k, v in state_dict.items() if k.startswith(key)}

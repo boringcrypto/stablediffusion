@@ -1,3 +1,4 @@
+from turtle import down
 import torch
 import torch.nn as nn
 import kornia
@@ -97,12 +98,21 @@ class FrozenCLIPEmbedder(AbstractEncoder):
     ]
 
     def __init__(self, version="openai/clip-vit-large-patch14", device="cuda", max_length=77,
-                 freeze=True, layer="last", layer_idx=None):  # clip-vit-base-patch32
+                 freeze=True, layer="last", layer_idx=None,
+                 state_dict=None
+                 ):  # clip-vit-base-patch32
         super().__init__()
         assert layer in self.LAYERS
-        self.tokenizer = CLIPTokenizer.from_pretrained(version)
-        self.transformer = CLIPTextModel.from_pretrained(version)
-        self.device = device
+        self.tokenizer = CLIPTokenizer.from_pretrained(version, local_files_only=True)
+        download = False
+        if (download):
+            self.transformer = CLIPTextModel.from_pretrained(version, local_files_only=True)
+            self.transformer.save_pretrained("models/clip")
+        else:
+            self.transformer = CLIPTextModel.from_pretrained("models/clip")
+
+        self.transformer.to(device)
+        self.device = device or "cuda"
         self.max_length = max_length
         if freeze:
             self.freeze()

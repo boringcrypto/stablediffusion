@@ -79,14 +79,14 @@ def count_params(model, verbose=False):
     return total_params
 
 
-def instantiate_from_config(config):
+def instantiate_from_config(config, device=None, state_dict=None):
     if not "target" in config:
         if config == '__is_first_stage__':
             return None
         elif config == "__is_unconditional__":
             return None
         raise KeyError("Expected key `target` to instantiate.")
-    return get_obj_from_str(config["target"])(**config.get("params", dict()))
+    return get_obj_from_str(config["target"])(**config.get("params", dict()), device=device, state_dict=state_dict)
 
 
 def get_obj_from_str(string, reload=False):

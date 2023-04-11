@@ -7,6 +7,9 @@ from einops import rearrange
 from typing import Optional, Any
 
 from ldm.modules.attention import MemoryEfficientCrossAttention
+from ldm.modules.diffusionmodules.util import dict_key
+from ldm.torch.conv import Conv2d
+from ldm.torch.normalization import GroupNorm
 
 try:
     import xformers
@@ -43,20 +46,22 @@ def nonlinearity(x):
     return x*torch.sigmoid(x)
 
 
-def Normalize(in_channels, num_groups=32):
-    return torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
+def Normalize(in_channels, num_groups=32, tensors=None, device=None):
+    return GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True, device=device, tensors=tensors)
 
 
 class Upsample(nn.Module):
-    def __init__(self, in_channels, with_conv):
+    def __init__(self, in_channels, with_conv, device=None, state_dict=None):
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
-            self.conv = torch.nn.Conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=3,
-                                        stride=1,
-                                        padding=1)
+            self.conv = Conv2d(in_channels,
+                                in_channels,
+                                kernel_size=3,
+                                stride=1,
+                                padding=1,
+                                device=device,
+                                tensors=dict_key(state_dict, "conv."))
 
     def forward(self, x):
         x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
@@ -66,16 +71,18 @@ class Upsample(nn.Module):
 
 
 class Downsample(nn.Module):
-    def __init__(self, in_channels, with_conv):
+    def __init__(self, in_channels, with_conv, device=None, state_dict=None):
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
             # no asymmetric padding in torch conv, must do it ourselves
-            self.conv = torch.nn.Conv2d(in_channels,
+            self.conv = Conv2d(in_channels,
                                         in_channels,
                                         kernel_size=3,
                                         stride=2,
-                                        padding=0)
+                                        padding=0,
+                                        device=device,
+                                        tensors=dict_key(state_dict, "conv."))
 
     def forward(self, x):
         if self.with_conv:
@@ -89,42 +96,51 @@ class Downsample(nn.Module):
 
 class ResnetBlock(nn.Module):
     def __init__(self, *, in_channels, out_channels=None, conv_shortcut=False,
-                 dropout, temb_channels=512):
+                 dropout, temb_channels=512, device=None, state_dict):
         super().__init__()
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
 
-        self.norm1 = Normalize(in_channels)
-        self.conv1 = torch.nn.Conv2d(in_channels,
-                                     out_channels,
-                                     kernel_size=3,
-                                     stride=1,
-                                     padding=1)
+        self.norm1 = Normalize(in_channels, device=device, tensors=dict_key(state_dict, "norm1."))
+        self.conv1 = Conv2d(in_channels,
+                            out_channels,
+                            kernel_size=3,
+                            stride=1,
+                            padding=1,
+                            device=device,
+                            tensors=dict_key(state_dict, "conv1."))
         if temb_channels > 0:
             self.temb_proj = torch.nn.Linear(temb_channels,
-                                             out_channels)
-        self.norm2 = Normalize(out_channels)
+                                             out_channels,
+                                             device=device)
+        self.norm2 = Normalize(out_channels, device=device, tensors=dict_key(state_dict, "norm2."))
         self.dropout = torch.nn.Dropout(dropout)
-        self.conv2 = torch.nn.Conv2d(out_channels,
-                                     out_channels,
-                                     kernel_size=3,
-                                     stride=1,
-                                     padding=1)
+        self.conv2 = Conv2d(out_channels,
+                            out_channels,
+                            kernel_size=3,
+                            stride=1,
+                            padding=1,
+                            device=device,
+                            tensors=dict_key(state_dict, "conv2."))
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
-                self.conv_shortcut = torch.nn.Conv2d(in_channels,
-                                                     out_channels,
-                                                     kernel_size=3,
-                                                     stride=1,
-                                                     padding=1)
+                self.conv_shortcut = Conv2d(in_channels,
+                                            out_channels,
+                                            kernel_size=3,
+                                            stride=1,
+                                            padding=1,
+                                            device=device,
+                                            tensors=dict_key(state_dict, "conv_shortcut."))
             else:
-                self.nin_shortcut = torch.nn.Conv2d(in_channels,
-                                                    out_channels,
-                                                    kernel_size=1,
-                                                    stride=1,
-                                                    padding=0)
+                self.nin_shortcut = Conv2d(in_channels,
+                                           out_channels,
+                                           kernel_size=1,
+                                           stride=1,
+                                           padding=0,
+                                           device=device,
+                                           tensors=dict_key(state_dict, "nin_shortcut."))
 
     def forward(self, x, temb):
         h = x
@@ -150,31 +166,35 @@ class ResnetBlock(nn.Module):
 
 
 class AttnBlock(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, device=None, state_dict=None):
         super().__init__()
         self.in_channels = in_channels
 
-        self.norm = Normalize(in_channels)
+        self.norm = Normalize(in_channels, device=device, tensors=dict_key(state_dict, "norm."))
         self.q = torch.nn.Conv2d(in_channels,
                                  in_channels,
                                  kernel_size=1,
                                  stride=1,
-                                 padding=0)
+                                 padding=0,
+                                 device=device)
         self.k = torch.nn.Conv2d(in_channels,
                                  in_channels,
                                  kernel_size=1,
                                  stride=1,
-                                 padding=0)
+                                 padding=0,
+                                 device=device)
         self.v = torch.nn.Conv2d(in_channels,
                                  in_channels,
                                  kernel_size=1,
                                  stride=1,
-                                 padding=0)
+                                 padding=0,
+                                 device=device)
         self.proj_out = torch.nn.Conv2d(in_channels,
                                         in_channels,
                                         kernel_size=1,
                                         stride=1,
-                                        padding=0)
+                                        padding=0,
+                                        device=device)
 
     def forward(self, x):
         h_ = x
@@ -209,31 +229,39 @@ class MemoryEfficientAttnBlock(nn.Module):
         Note: this is a single-head self-attention operation
     """
     #
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, device=None, state_dict=None):
         super().__init__()
         self.in_channels = in_channels
 
-        self.norm = Normalize(in_channels)
-        self.q = torch.nn.Conv2d(in_channels,
+        self.norm = Normalize(in_channels, device=device, tensors=dict_key(state_dict, "norm."))
+        self.q = Conv2d(in_channels,
                                  in_channels,
                                  kernel_size=1,
                                  stride=1,
-                                 padding=0)
-        self.k = torch.nn.Conv2d(in_channels,
+                                 padding=0,
+                                 device=device,
+                                 tensors=dict_key(state_dict, "q."))
+        self.k = Conv2d(in_channels,
                                  in_channels,
                                  kernel_size=1,
                                  stride=1,
-                                 padding=0)
-        self.v = torch.nn.Conv2d(in_channels,
+                                 padding=0,
+                                 device=device,
+                                 tensors=dict_key(state_dict, "k."))
+        self.v = Conv2d(in_channels,
                                  in_channels,
                                  kernel_size=1,
                                  stride=1,
-                                 padding=0)
-        self.proj_out = torch.nn.Conv2d(in_channels,
+                                 padding=0,
+                                 device=device,
+                                 tensors=dict_key(state_dict, "v."))
+        self.proj_out = Conv2d(in_channels,
                                         in_channels,
                                         kernel_size=1,
                                         stride=1,
-                                        padding=0)
+                                        padding=0,
+                                        device=device,
+                                        tensors=dict_key(state_dict, "proj_out."))
         self.attention_op: Optional[Any] = None
 
     def forward(self, x):
@@ -277,20 +305,20 @@ class MemoryEfficientCrossAttentionWrapper(MemoryEfficientCrossAttention):
         return x + out
 
 
-def make_attn(in_channels, attn_type="vanilla", attn_kwargs=None):
+def make_attn(in_channels, attn_type="vanilla", attn_kwargs=None, device=None, state_dict=None):
     assert attn_type in ["vanilla", "vanilla-xformers", "memory-efficient-cross-attn", "linear", "none"], f'attn_type {attn_type} unknown'
     if XFORMERS_IS_AVAILBLE and attn_type == "vanilla":
         attn_type = "vanilla-xformers"
     print(f"making attention of type '{attn_type}' with {in_channels} in_channels")
     if attn_type == "vanilla":
         assert attn_kwargs is None
-        return AttnBlock(in_channels)
+        return AttnBlock(in_channels, device, state_dict=state_dict)
     elif attn_type == "vanilla-xformers":
         print(f"building MemoryEfficientAttnBlock with {in_channels} in_channels...")
-        return MemoryEfficientAttnBlock(in_channels)
+        return MemoryEfficientAttnBlock(in_channels, device, state_dict=state_dict)
     elif type == "memory-efficient-cross-attn":
         attn_kwargs["query_dim"] = in_channels
-        return MemoryEfficientCrossAttentionWrapper(**attn_kwargs)
+        return MemoryEfficientCrossAttentionWrapper(**attn_kwargs, device=device)
     elif attn_type == "none":
         return nn.Identity(in_channels)
     else:
@@ -300,7 +328,8 @@ def make_attn(in_channels, attn_type="vanilla", attn_kwargs=None):
 class Model(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, use_timestep=True, use_linear_attn=False, attn_type="vanilla"):
+                 resolution, use_timestep=True, use_linear_attn=False, attn_type="vanilla",
+                 device=None, state_dict=None):
         super().__init__()
         if use_linear_attn: attn_type = "linear"
         self.ch = ch
@@ -316,9 +345,11 @@ class Model(nn.Module):
             self.temb = nn.Module()
             self.temb.dense = nn.ModuleList([
                 torch.nn.Linear(self.ch,
-                                self.temb_ch),
+                                self.temb_ch,
+                                device=device),
                 torch.nn.Linear(self.temb_ch,
-                                self.temb_ch),
+                                self.temb_ch,
+                                device=device),
             ])
 
         # downsampling
@@ -326,7 +357,8 @@ class Model(nn.Module):
                                        self.ch,
                                        kernel_size=3,
                                        stride=1,
-                                       padding=1)
+                                       padding=1,
+                                       device=device)
 
         curr_res = resolution
         in_ch_mult = (1,)+tuple(ch_mult)
@@ -340,7 +372,8 @@ class Model(nn.Module):
                 block.append(ResnetBlock(in_channels=block_in,
                                          out_channels=block_out,
                                          temb_channels=self.temb_ch,
-                                         dropout=dropout))
+                                         dropout=dropout,
+                                         device=device))
                 block_in = block_out
                 if curr_res in attn_resolutions:
                     attn.append(make_attn(block_in, attn_type=attn_type))
@@ -348,7 +381,7 @@ class Model(nn.Module):
             down.block = block
             down.attn = attn
             if i_level != self.num_resolutions-1:
-                down.downsample = Downsample(block_in, resamp_with_conv)
+                down.downsample = Downsample(block_in, resamp_with_conv, device=device)
                 curr_res = curr_res // 2
             self.down.append(down)
 
@@ -357,12 +390,14 @@ class Model(nn.Module):
         self.mid.block_1 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
-                                       dropout=dropout)
+                                       dropout=dropout,
+                                       device=device)
         self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
         self.mid.block_2 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
-                                       dropout=dropout)
+                                       dropout=dropout,
+                                       device=device)
 
         # upsampling
         self.up = nn.ModuleList()
@@ -377,25 +412,27 @@ class Model(nn.Module):
                 block.append(ResnetBlock(in_channels=block_in+skip_in,
                                          out_channels=block_out,
                                          temb_channels=self.temb_ch,
-                                         dropout=dropout))
+                                         dropout=dropout,
+                                         device=device))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(make_attn(block_in, attn_type=attn_type))
+                    attn.append(make_attn(block_in, attn_type=attn_type, device=device))
             up = nn.Module()
             up.block = block
             up.attn = attn
             if i_level != 0:
-                up.upsample = Upsample(block_in, resamp_with_conv)
+                up.upsample = Upsample(block_in, resamp_with_conv, device=device)
                 curr_res = curr_res * 2
             self.up.insert(0, up) # prepend to get consistent order
 
         # end
-        self.norm_out = Normalize(block_in)
+        self.norm_out = Normalize(block_in, device=device, tensors=dict_key(state_dict, "norm_out"))
         self.conv_out = torch.nn.Conv2d(block_in,
                                         out_ch,
                                         kernel_size=3,
                                         stride=1,
-                                        padding=1)
+                                        padding=1,
+                                        device=device)
 
     def forward(self, x, t=None, context=None):
         #assert x.shape[2] == x.shape[3] == self.resolution
@@ -453,6 +490,8 @@ class Encoder(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
                  resolution, z_channels, double_z=True, use_linear_attn=False, attn_type="vanilla",
+                 device=None,
+                 state_dict=None,
                  **ignore_kwargs):
         super().__init__()
         if use_linear_attn: attn_type = "linear"
@@ -464,11 +503,13 @@ class Encoder(nn.Module):
         self.in_channels = in_channels
 
         # downsampling
-        self.conv_in = torch.nn.Conv2d(in_channels,
+        self.conv_in = Conv2d(in_channels,
                                        self.ch,
                                        kernel_size=3,
                                        stride=1,
-                                       padding=1)
+                                       padding=1,
+                                       device=device,
+                                       tensors=dict_key(state_dict, "conv_in."))
 
         curr_res = resolution
         in_ch_mult = (1,)+tuple(ch_mult)
@@ -483,7 +524,9 @@ class Encoder(nn.Module):
                 block.append(ResnetBlock(in_channels=block_in,
                                          out_channels=block_out,
                                          temb_channels=self.temb_ch,
-                                         dropout=dropout))
+                                         dropout=dropout,
+                                         device=device,
+                                         state_dict=dict_key(state_dict, "down.{}.block.{}.".format(i_level, i_block))))
                 block_in = block_out
                 if curr_res in attn_resolutions:
                     attn.append(make_attn(block_in, attn_type=attn_type))
@@ -491,7 +534,7 @@ class Encoder(nn.Module):
             down.block = block
             down.attn = attn
             if i_level != self.num_resolutions-1:
-                down.downsample = Downsample(block_in, resamp_with_conv)
+                down.downsample = Downsample(block_in, resamp_with_conv, device=device, state_dict=dict_key(state_dict, "down.{}.downsample.".format(i_level)))
                 curr_res = curr_res // 2
             self.down.append(down)
 
@@ -500,20 +543,32 @@ class Encoder(nn.Module):
         self.mid.block_1 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
-                                       dropout=dropout)
-        self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
+                                       dropout=dropout,
+                                       device=device,
+                                       state_dict=dict_key(state_dict, "mid.block_1."))
+        self.mid.attn_1 = make_attn(block_in, attn_type=attn_type, device=device, state_dict=dict_key(state_dict, "mid.attn_1."))
         self.mid.block_2 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
-                                       dropout=dropout)
+                                       dropout=dropout,
+                                       device=device,
+                                       state_dict=dict_key(state_dict, "mid.block_2."))
 
         # end
-        self.norm_out = Normalize(block_in)
-        self.conv_out = torch.nn.Conv2d(block_in,
+        self.norm_out = Normalize(block_in, device=device, tensors=dict_key(state_dict, "norm_out."))
+        self.conv_out = Conv2d(block_in,
                                         2*z_channels if double_z else z_channels,
                                         kernel_size=3,
                                         stride=1,
-                                        padding=1)
+                                        padding=1,
+                                        device=device,
+                                        tensors=dict_key(state_dict, "conv_out."))
+
+        print("Done building model.")
+        for (name, param) in self.named_parameters():
+            if (str(param.device) == "cpu"):
+                print(name, param.device, param.dtype)
+
 
     def forward(self, x):
         # timestep embedding
@@ -547,7 +602,7 @@ class Decoder(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
                  resolution, z_channels, give_pre_end=False, tanh_out=False, use_linear_attn=False,
-                 attn_type="vanilla", **ignorekwargs):
+                 attn_type="vanilla", device=None, state_dict=None, **ignorekwargs):
         super().__init__()
         if use_linear_attn: attn_type = "linear"
         self.ch = ch
@@ -568,23 +623,29 @@ class Decoder(nn.Module):
             self.z_shape, np.prod(self.z_shape)))
 
         # z to block_in
-        self.conv_in = torch.nn.Conv2d(z_channels,
+        self.conv_in = Conv2d(z_channels,
                                        block_in,
                                        kernel_size=3,
                                        stride=1,
-                                       padding=1)
+                                       padding=1,
+                                       device=device,
+                                       tensors=dict_key(state_dict, "conv_in."))
 
         # middle
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
-                                       dropout=dropout)
-        self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
+                                       dropout=dropout,
+                                       device=device,
+                                       state_dict=dict_key(state_dict, "mid.block_1."))
+        self.mid.attn_1 = make_attn(block_in, attn_type=attn_type, device=device, state_dict=dict_key(state_dict, "mid.attn_1."))
         self.mid.block_2 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
-                                       dropout=dropout)
+                                       dropout=dropout,
+                                       device=device,
+                                       state_dict=dict_key(state_dict, "mid.block_2."))
 
         # upsampling
         self.up = nn.ModuleList()
@@ -596,7 +657,9 @@ class Decoder(nn.Module):
                 block.append(ResnetBlock(in_channels=block_in,
                                          out_channels=block_out,
                                          temb_channels=self.temb_ch,
-                                         dropout=dropout))
+                                         dropout=dropout,
+                                         device=device,
+                                         state_dict=dict_key(state_dict, "up.{}.block.{}.".format(i_level, i_block))))
                 block_in = block_out
                 if curr_res in attn_resolutions:
                     attn.append(make_attn(block_in, attn_type=attn_type))
@@ -604,17 +667,25 @@ class Decoder(nn.Module):
             up.block = block
             up.attn = attn
             if i_level != 0:
-                up.upsample = Upsample(block_in, resamp_with_conv)
+                up.upsample = Upsample(block_in, resamp_with_conv, device=device, state_dict=dict_key(state_dict, "up.{}.upsample.".format(i_level)))
                 curr_res = curr_res * 2
             self.up.insert(0, up) # prepend to get consistent order
 
         # end
-        self.norm_out = Normalize(block_in)
-        self.conv_out = torch.nn.Conv2d(block_in,
-                                        out_ch,
-                                        kernel_size=3,
-                                        stride=1,
-                                        padding=1)
+        self.norm_out = Normalize(block_in, device=device, tensors=dict_key(state_dict, "norm_out."))
+        self.conv_out = Conv2d(block_in,
+                               out_ch,
+                               kernel_size=3,
+                               stride=1,
+                               padding=1,
+                               device=device,
+                               tensors=dict_key(state_dict, "conv_out."))
+
+        print("Done building model.")
+        for (name, param) in self.named_parameters():
+            if str(param.device) == "cpu":
+                print(name, param.device, param.dtype)
+
 
     def forward(self, z):
         #assert z.shape[1:] == self.z_shape[1:]
@@ -653,27 +724,31 @@ class Decoder(nn.Module):
 
 
 class SimpleDecoder(nn.Module):
-    def __init__(self, in_channels, out_channels, *args, **kwargs):
+    def __init__(self, in_channels, out_channels, device=None, *args, **kwargs):
         super().__init__()
-        self.model = nn.ModuleList([nn.Conv2d(in_channels, in_channels, 1),
+        self.model = nn.ModuleList([nn.Conv2d(in_channels, in_channels, 1, device=device),
                                      ResnetBlock(in_channels=in_channels,
                                                  out_channels=2 * in_channels,
-                                                 temb_channels=0, dropout=0.0),
+                                                 temb_channels=0, dropout=0.0,
+                                                 device=device),
                                      ResnetBlock(in_channels=2 * in_channels,
                                                 out_channels=4 * in_channels,
-                                                temb_channels=0, dropout=0.0),
+                                                temb_channels=0, dropout=0.0,
+                                                device=device),
                                      ResnetBlock(in_channels=4 * in_channels,
                                                 out_channels=2 * in_channels,
-                                                temb_channels=0, dropout=0.0),
-                                     nn.Conv2d(2*in_channels, in_channels, 1),
-                                     Upsample(in_channels, with_conv=True)])
+                                                temb_channels=0, dropout=0.0,
+                                                    ),
+                                     nn.Conv2d(2*in_channels, in_channels, 1, device=device),
+                                     Upsample(in_channels, with_conv=True, device=device)])
         # end
-        self.norm_out = Normalize(in_channels)
+        self.norm_out = Normalize(in_channels, device=device)
         self.conv_out = torch.nn.Conv2d(in_channels,
                                         out_channels,
                                         kernel_size=3,
                                         stride=1,
-                                        padding=1)
+                                        padding=1,
+                                        device=device)
 
     def forward(self, x):
         for i, layer in enumerate(self.model):
@@ -690,7 +765,7 @@ class SimpleDecoder(nn.Module):
 
 class UpsampleDecoder(nn.Module):
     def __init__(self, in_channels, out_channels, ch, num_res_blocks, resolution,
-                 ch_mult=(2,2), dropout=0.0):
+                 ch_mult=(2,2), dropout=0.0, device=None):
         super().__init__()
         # upsampling
         self.temb_ch = 0
@@ -707,20 +782,22 @@ class UpsampleDecoder(nn.Module):
                 res_block.append(ResnetBlock(in_channels=block_in,
                                          out_channels=block_out,
                                          temb_channels=self.temb_ch,
-                                         dropout=dropout))
+                                         dropout=dropout,
+                                         device=device))
                 block_in = block_out
             self.res_blocks.append(nn.ModuleList(res_block))
             if i_level != self.num_resolutions - 1:
-                self.upsample_blocks.append(Upsample(block_in, True))
+                self.upsample_blocks.append(Upsample(block_in, True, device=device))
                 curr_res = curr_res * 2
 
         # end
-        self.norm_out = Normalize(block_in)
+        self.norm_out = Normalize(block_in, device=device)
         self.conv_out = torch.nn.Conv2d(block_in,
                                         out_channels,
                                         kernel_size=3,
                                         stride=1,
-                                        padding=1)
+                                        padding=1,
+                                        device=device)
 
     def forward(self, x):
         # upsampling

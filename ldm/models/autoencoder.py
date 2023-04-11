@@ -4,7 +4,9 @@ import torch.nn.functional as F
 from contextlib import contextmanager
 
 from ldm.modules.diffusionmodules.model import Encoder, Decoder
+from ldm.modules.diffusionmodules.util import dict_key
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
+from ldm.torch.conv import Conv2d
 
 from ldm.util import instantiate_from_config
 from ldm.modules.ema import LitEma
@@ -21,17 +23,20 @@ class AutoencoderKL(pl.LightningModule):
                  colorize_nlabels=None,
                  monitor=None,
                  ema_decay=None,
-                 learn_logvar=False
+                 learn_logvar=False,
+                 device=None,
+                 state_dict=None
                  ):
         super().__init__()
+        print(state_dict)
         self.learn_logvar = learn_logvar
         self.image_key = image_key
-        self.encoder = Encoder(**ddconfig)
-        self.decoder = Decoder(**ddconfig)
+        self.encoder = Encoder(**ddconfig, device=device, state_dict=dict_key(state_dict, "encoder."))
+        self.decoder = Decoder(**ddconfig, device=device, state_dict=dict_key(state_dict, "decoder."))
         self.loss = instantiate_from_config(lossconfig)
         assert ddconfig["double_z"]
-        self.quant_conv = torch.nn.Conv2d(2*ddconfig["z_channels"], 2*embed_dim, 1)
-        self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
+        self.quant_conv = Conv2d(2*ddconfig["z_channels"], 2*embed_dim, 1, device=device, tensors=dict_key(state_dict, "quant_conv."))
+        self.post_quant_conv = Conv2d(embed_dim, ddconfig["z_channels"], 1, device=device, tensors=dict_key(state_dict, "post_quant_conv."))
         self.embed_dim = embed_dim
         if colorize_nlabels is not None:
             assert type(colorize_nlabels)==int
