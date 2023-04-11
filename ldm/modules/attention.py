@@ -9,6 +9,7 @@ from typing import Optional, Any
 from ldm.modules.diffusionmodules.util import checkpoint, dict_key
 from ldm.torch.conv import Conv2d
 from ldm.torch.linear import Linear
+from ldm.torch.normalization import LayerNorm
 
 
 try:
@@ -49,9 +50,9 @@ def init_(tensor):
 
 # feedforward
 class GEGLU(nn.Module):
-    def __init__(self, dim_in, dim_out, device=None):
+    def __init__(self, dim_in, dim_out, device=None, state_dict=None):
         super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out * 2, device=device)
+        self.proj = Linear(dim_in, dim_out * 2, device=device, tensors=dict_key(state_dict, 'proj.'))
 
     def forward(self, x):
         x, gate = self.proj(x).chunk(2, dim=-1)
@@ -64,14 +65,14 @@ class FeedForward(nn.Module):
         inner_dim = int(dim * mult)
         dim_out = default(dim_out, dim)
         project_in = nn.Sequential(
-            Linear(dim, inner_dim, device=device),
+            Linear(dim, inner_dim, device=device, tensors=dict_key(state_dict, 'net.0.')),
             nn.GELU()
-        ) if not glu else GEGLU(dim, inner_dim, device=device)
+        ) if not glu else GEGLU(dim, inner_dim, device=device, state_dict=dict_key(state_dict, 'net.0.'))
 
         self.net = nn.Sequential(
             project_in,
             nn.Dropout(dropout),
-            nn.Linear(inner_dim, dim_out, device=device)
+            Linear(inner_dim, dim_out, device=device, tensors=dict_key(state_dict, 'net.2.')),
         )
 
     def forward(self, x):
@@ -198,7 +199,7 @@ class CrossAttention(nn.Module):
 
 class MemoryEfficientCrossAttention(nn.Module):
     # https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0, device=None):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0, device=None, state_dict=None):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
@@ -206,11 +207,14 @@ class MemoryEfficientCrossAttention(nn.Module):
         self.heads = heads
         self.dim_head = dim_head
 
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False, device=device)
-        self.to_k = nn.Linear(context_dim, inner_dim, bias=False, device=device)
-        self.to_v = nn.Linear(context_dim, inner_dim, bias=False, device=device)
+        self.to_q = Linear(query_dim, inner_dim, bias=False, device=device, tensors=dict_key(state_dict, 'to_q.'))
+        self.to_k = Linear(context_dim, inner_dim, bias=False, device=device, tensors=dict_key(state_dict, 'to_k.'))
+        self.to_v = Linear(context_dim, inner_dim, bias=False, device=device, tensors=dict_key(state_dict, 'to_v.'))
 
-        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim, device=device), nn.Dropout(dropout))
+        self.to_out = nn.Sequential(
+            Linear(inner_dim, query_dim, device=device, tensors=dict_key(state_dict, 'to_out.0.')), 
+            nn.Dropout(dropout)
+        )
         self.attention_op: Optional[Any] = None
 
     def forward(self, x, context=None, mask=None):
@@ -256,14 +260,16 @@ class BasicTransformerBlock(nn.Module):
         attn_cls = self.ATTENTION_MODES[attn_mode]
         self.disable_self_attn = disable_self_attn
         self.attn1 = attn_cls(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout,
-                              context_dim=context_dim if self.disable_self_attn else None, device=device)  # is a self-attention if not self.disable_self_attn
-        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff, device=device)
+                              context_dim=context_dim if self.disable_self_attn else None, device=device,
+                              state_dict=dict_key(state_dict, "attn1."))  # is a self-attention if not self.disable_self_attn
+        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff, device=device, state_dict=dict_key(state_dict, "ff."))
         self.attn2 = attn_cls(query_dim=dim, context_dim=context_dim,
                               heads=n_heads, dim_head=d_head, dropout=dropout,
-                              device=device)  # is self-attn if context is none
-        self.norm1 = nn.LayerNorm(dim, device=device)
-        self.norm2 = nn.LayerNorm(dim, device=device)
-        self.norm3 = nn.LayerNorm(dim, device=device)
+                              device=device,
+                              state_dict=dict_key(state_dict, "attn2."))  # is self-attn if context is none
+        self.norm1 = LayerNorm(dim, device=device, tensors=dict_key(state_dict, "norm1."))
+        self.norm2 = LayerNorm(dim, device=device, tensors=dict_key(state_dict, "norm2."))
+        self.norm3 = LayerNorm(dim, device=device, tensors=dict_key(state_dict, "norm3."))
         self.checkpoint = checkpoint
 
     def forward(self, x, context=None):
@@ -310,7 +316,8 @@ class SpatialTransformer(nn.Module):
 
         self.transformer_blocks = nn.ModuleList(
             [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim[d],
-                                   disable_self_attn=disable_self_attn, checkpoint=use_checkpoint, device=device)
+                                   disable_self_attn=disable_self_attn, checkpoint=use_checkpoint, device=device,
+                                   state_dict=dict_key(state_dict, f"transformer_blocks.{d}."))
                 for d in range(depth)]
         )
         if not use_linear:
