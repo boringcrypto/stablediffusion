@@ -229,7 +229,7 @@ class ResBlock(TimestepBlock):
         self.out_layers = nn.Sequential(
             normalization(self.out_channels, device, tensors=dict_key(state_dict, 'out_layers.0.')),
             nn.SiLU(),
-            nn.Dropout(p=dropout),
+            nn.Identity() if dropout == 0 else nn.Dropout(dropout),
             zero_module(
                 conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1, device=device, tensors=dict_key(state_dict, 'out_layers.3.'))
             ),

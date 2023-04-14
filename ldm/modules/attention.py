@@ -9,7 +9,7 @@ from typing import Optional, Any
 from ldm.modules.diffusionmodules.util import checkpoint, dict_key
 from ldm.torch.conv import Conv2d
 from ldm.torch.linear import Linear
-from ldm.torch.normalization import LayerNorm
+from ldm.torch.normalization import GroupNorm, LayerNorm
 
 
 try:
@@ -71,7 +71,7 @@ class FeedForward(nn.Module):
 
         self.net = nn.Sequential(
             project_in,
-            nn.Dropout(dropout),
+            nn.Identity() if dropout == 0 else nn.Dropout(dropout),
             Linear(inner_dim, dim_out, device=device, tensors=dict_key(state_dict, 'net.2.')),
         )
 
@@ -88,8 +88,9 @@ def zero_module(module):
     return module
 
 
-def Normalize(in_channels, device=None):
-    return torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True, device=device)
+def Normalize(in_channels, device=None, tensors=None):
+    return GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True, device=device,
+                     tensors=tensors)
 
 
 class SpatialSelfAttention(nn.Module):
@@ -160,7 +161,7 @@ class CrossAttention(nn.Module):
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim, device=device),
-            nn.Dropout(dropout)
+            nn.Identity() if dropout == 0 else nn.Dropout(dropout)
         )
 
     def forward(self, x, context=None, mask=None):
@@ -213,7 +214,7 @@ class MemoryEfficientCrossAttention(nn.Module):
 
         self.to_out = nn.Sequential(
             Linear(inner_dim, query_dim, device=device, tensors=dict_key(state_dict, 'to_out.0.')), 
-            nn.Dropout(dropout)
+            nn.Identity() if dropout == 0 else nn.Dropout(dropout)
         )
         self.attention_op: Optional[Any] = None
 
@@ -302,7 +303,7 @@ class SpatialTransformer(nn.Module):
             context_dim = [context_dim]
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
-        self.norm = Normalize(in_channels, device)
+        self.norm = Normalize(in_channels, device, tensors=dict_key(state_dict, "norm."))
         if not use_linear:
             self.proj_in = Conv2d(in_channels,
                                      inner_dim,

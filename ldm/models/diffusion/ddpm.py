@@ -6,6 +6,7 @@ https://github.com/CompVis/taming-transformers
 -- merci
 """
 
+import time
 import torch
 import torch.nn as nn
 import numpy as np
@@ -80,7 +81,10 @@ class DDPM(pl.LightningModule):
                  device=None,
                  state_dict=None
                  ):
+        # start timer
+        self.start_time = time.time()
         super().__init__()
+        print("After init", time.time() - self.start_time)
         assert parameterization in ["eps", "x0", "v"], 'currently only supporting "eps" and "x0" and "v"'
         self.parameterization = parameterization
         print(f"{self.__class__.__name__}: Running in {self.parameterization}-prediction mode")
@@ -91,8 +95,9 @@ class DDPM(pl.LightningModule):
         self.image_size = image_size  # try conv?
         self.channels = channels
         self.use_positional_encodings = use_positional_encodings
+        print("Before model", time.time() - self.start_time)
         self.model = DiffusionWrapper(unet_config, conditioning_key, device, dict_key(state_dict, "model."))
-        count_params(self.model, verbose=True)
+        print("After model", time.time() - self.start_time)
         self.use_ema = use_ema
         if self.use_ema:
             self.model_ema = LitEma(self.model)
@@ -121,13 +126,17 @@ class DDPM(pl.LightningModule):
             assert self.use_ema
             self.model_ema.reset_num_updates()
 
+        print("Before register schedule", time.time() - self.start_time)
         self.register_schedule(given_betas=given_betas, beta_schedule=beta_schedule, timesteps=timesteps,
                                linear_start=linear_start, linear_end=linear_end, cosine_s=cosine_s, device=device)
+        print("After register schedule", time.time() - self.start_time)
 
         self.loss_type = loss_type
 
         self.learn_logvar = learn_logvar
+        print("Before logvar", time.time() - self.start_time)
         self.logvar = torch.full(fill_value=logvar_init, size=(self.num_timesteps,))
+        print("After logvar", time.time() - self.start_time)
         if self.learn_logvar:
             self.logvar = nn.Parameter(self.logvar, requires_grad=True)
 
@@ -135,16 +144,25 @@ class DDPM(pl.LightningModule):
         if self.ucg_training:
             self.ucg_prng = np.random.RandomState()
 
+        print("After register schedule", time.time() - self.start_time)
+
     def register_schedule(self, given_betas=None, beta_schedule="linear", timesteps=1000,
                           linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3, device=None):
+        # start timer
+        self.start_time = time.time()
+        print("Before betas", time.time() - self.start_time)
         if exists(given_betas):
             betas = given_betas
         else:
             betas = make_beta_schedule(beta_schedule, timesteps, linear_start=linear_start, linear_end=linear_end,
                                        cosine_s=cosine_s)
+        print("After betas", time.time() - self.start_time)
+
         alphas = 1. - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
         alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+
+        print("After alphas", time.time() - self.start_time)
 
         timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
@@ -152,11 +170,15 @@ class DDPM(pl.LightningModule):
         self.linear_end = linear_end
         assert alphas_cumprod.shape[0] == self.num_timesteps, 'alphas have to be defined for each timestep'
 
+        print("After assert", time.time() - self.start_time)
+
         to_torch = partial(torch.tensor, dtype=torch.float32, device=device)
 
         self.register_buffer('betas', to_torch(betas))
         self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
         self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))
+
+        print("After register buffer", time.time() - self.start_time)
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
         self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
@@ -164,6 +186,8 @@ class DDPM(pl.LightningModule):
         self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod)))
         self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod)))
         self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod - 1)))
+
+        print("After register buffer 2", time.time() - self.start_time)
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         posterior_variance = (1 - self.v_posterior) * betas * (1. - alphas_cumprod_prev) / (
@@ -177,19 +201,26 @@ class DDPM(pl.LightningModule):
         self.register_buffer('posterior_mean_coef2', to_torch(
             (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
 
-        if self.parameterization == "eps":
-            lvlb_weights = self.betas ** 2 / (
-                    2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
-        elif self.parameterization == "x0":
-            lvlb_weights = 0.5 * np.sqrt(torch.Tensor(alphas_cumprod)) / (2. * 1 - torch.Tensor(alphas_cumprod))
-        elif self.parameterization == "v":
-            lvlb_weights = torch.ones_like(self.betas ** 2 / (
-                    2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod)))
-        else:
-            raise NotImplementedError("mu not supported")
-        lvlb_weights[0] = lvlb_weights[1]
-        self.register_buffer('lvlb_weights', lvlb_weights, persistent=False)
-        assert not torch.isnan(self.lvlb_weights).all()
+        print("After posterior_mean_coef2", time.time() - self.start_time)
+
+        # if self.parameterization == "eps":
+        #     lvlb_weights = self.betas ** 2 / (
+        #             2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
+        # elif self.parameterization == "x0":
+        #     lvlb_weights = 0.5 * np.sqrt(torch.Tensor(alphas_cumprod)) / (2. * 1 - torch.Tensor(alphas_cumprod))
+        # elif self.parameterization == "v":
+        #     lvlb_weights = torch.ones_like(self.betas ** 2 / (
+        #             2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod)))
+        # else:
+        #     raise NotImplementedError("mu not supported")
+        
+        print("After lvlb_weights", time.time() - self.start_time)
+
+        # lvlb_weights[0] = lvlb_weights[1]
+        # self.register_buffer('lvlb_weights', lvlb_weights, persistent=False)
+        # assert not torch.isnan(self.lvlb_weights).all()
+
+        print("After register buffer 3", time.time() - self.start_time)
 
     @contextmanager
     def ema_scope(self, context=None):
@@ -525,7 +556,7 @@ class LatentDiffusion(DDPM):
 
     def __init__(self,
                  first_stage_config,
-                 cond_stage_config,
+                 cond_stage_config=None,
                  num_timesteps_cond=None,
                  cond_stage_key="image",
                  cond_stage_trainable=False,
@@ -539,6 +570,8 @@ class LatentDiffusion(DDPM):
                  state_dict=None,
                  *args, **kwargs):
         print("LatentDiffusion", device)
+        # start timer
+        self.start_time = time.time()
         self.force_null_conditioning = force_null_conditioning
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -552,7 +585,9 @@ class LatentDiffusion(DDPM):
         reset_ema = kwargs.pop("reset_ema", False)
         reset_num_ema_updates = kwargs.pop("reset_num_ema_updates", False)
         ignore_keys = kwargs.pop("ignore_keys", [])
+        print("Before super", time.time() - self.start_time)
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs, device=device, state_dict=state_dict)
+        print("After super", time.time() - self.start_time)
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
         self.cond_stage_key = cond_stage_key
@@ -564,8 +599,12 @@ class LatentDiffusion(DDPM):
             self.scale_factor = scale_factor
         else:
             self.register_buffer('scale_factor', torch.tensor(scale_factor))
+        
+        print("Before first", time.time() - self.start_time)
         self.instantiate_first_stage(first_stage_config, device, state_dict)
+        print("After first", time.time() - self.start_time)
         self.instantiate_cond_stage(cond_stage_config, device, state_dict)
+        print("After cond", time.time() - self.start_time)
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None
@@ -623,6 +662,9 @@ class LatentDiffusion(DDPM):
             param.requires_grad = False
 
     def instantiate_cond_stage(self, config, device, state_dict):
+        if (not config):
+            return
+        
         if not self.cond_stage_trainable:
             if config == "__is_first_stage__":
                 print("Using first stage also as cond stage.")

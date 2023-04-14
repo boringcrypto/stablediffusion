@@ -12,6 +12,7 @@ from torchvision.utils import make_grid
 from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import nullcontext
+from ldm.modules.encoders.modules import FrozenCLIPEmbedder, FrozenOpenCLIPEmbedder
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -31,12 +32,27 @@ def load_model_from_config(config, ckpt, device=torch.device("cuda"), verbose=Fa
     start = time.time()
     
     pl_sd = torch.load(ckpt, map_location="cuda")
-    # # cast all tensors to float16
+    # cast all tensors to float16
     # for k in pl_sd["state_dict"]:
     #     if isinstance(pl_sd["state_dict"][k], torch.Tensor):
     #         pl_sd["state_dict"][k] = pl_sd["state_dict"][k].half()
 
-    # # add _16 to the base filename in ckpt
+    # copy all keys from pl_sd to a new dict that start with "first_stage_model." and remove the prefix
+    # vae = {}
+    # for k in pl_sd["state_dict"]:
+    #     if k.startswith("first_stage_model."):
+    #         vae[k.replace("first_stage_model.", "")] = pl_sd["state_dict"][k]
+
+    # # save the vae checkpoint
+    # ckpt = os.path.splitext(ckpt)[0] + "_vae" + os.path.splitext(ckpt)[1]
+    # torch.save(vae, ckpt)
+
+    # # delete all keys from pl_sd that start with "cond_stage_model."
+    # for k in list(pl_sd["state_dict"]):
+    #     if k.startswith("cond_stage_model."):
+    #         del pl_sd["state_dict"][k]
+
+    # add _16 to the base filename in ckpt
     # ckpt = os.path.splitext(ckpt)[0] + "_16" + os.path.splitext(ckpt)[1]
     # torch.save(pl_sd, ckpt)
 
@@ -50,17 +66,10 @@ def load_model_from_config(config, ckpt, device=torch.device("cuda"), verbose=Fa
     # print time to instantiate model
     print(f"Instantiated model in {time.time() - start:.2f} seconds")
 
-    m, u = model.load_state_dict(sd, strict=False)
+    # m, u = model.load_state_dict(sd, strict=False)
     # print time to load state dict
     print(f"Loaded state dict in {time.time() - start:.2f} seconds")
     
-    if len(m) > 0 and verbose:
-        print("missing keys:")
-        print(m)
-    if len(u) > 0 and verbose:
-        print("unexpected keys:")
-        print(u)
-
     model.eval()
     return model
 
@@ -141,7 +150,7 @@ def parse_args():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=1,
+        default=3,
         help="how many samples to produce for each given prompt. A.k.a batch size",
     )
     parser.add_argument(
@@ -164,13 +173,14 @@ def parse_args():
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/stable-diffusion/v1-inference.yaml",
+        default="configs/stable-diffusion/v2-inference-v.yaml",
         help="path to config which constructs model",
     )
     parser.add_argument(
         "--ckpt",
         type=str,
-        default="checkpoints/v1-5-pruned-emaonly_16.ckpt",
+        # default="checkpoints/v1-5-pruned-emaonly_16.ckpt",
+        default="checkpoints/v2-1_768-ema-pruned_16.ckpt",
         help="path to checkpoint of model",
     )
     parser.add_argument(
@@ -189,7 +199,7 @@ def parse_args():
     parser.add_argument(
         "--repeat",
         type=int,
-        default=1,
+        default=3,
         help="repeat each prompt in file this often",
     )
     parser.add_argument(
@@ -219,6 +229,9 @@ def parse_args():
 
 
 def main(opt):
+    clip = FrozenCLIPEmbedder()
+    clip = FrozenOpenCLIPEmbedder(freeze=True, layer="penultimate")
+
     # Start a timer
     start_time = time.time()
     print("Start timer")
@@ -228,7 +241,6 @@ def main(opt):
     config = OmegaConf.load(f"{opt.config}")
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
     model = load_model_from_config(config, f"{opt.ckpt}", device)
-    model.half()
     # print time elapsed for loading model
     print(f"Model loaded in {time.time() - start_time:.2f} seconds")
 
@@ -238,6 +250,8 @@ def main(opt):
         sampler = DPMSolverSampler(model, device=device)
     else:
         sampler = DDIMSampler(model, device=device)
+
+    print("Sampler initialized", time.time() - start_time)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
@@ -250,11 +264,9 @@ def main(opt):
     grid_count = len(os.listdir(outpath)) - 1
 
     start_code = None
-    if opt.fixed_code:
-        start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device, dtype=torch.float16)
 
     if opt.torchscript or opt.ipex:
-        transformer = model.cond_stage_model.model
+        # transformer = clip.model
         unet = model.model.diffusion_model
         decoder = model.first_stage_model.decoder
         additional_context = torch.cpu.amp.autocast() if opt.bf16 else nullcontext()
@@ -287,32 +299,32 @@ def main(opt):
                     raise ValueError("Gradient checkpoint won't work with tracing. " +
                     "Use configs/stable-diffusion/intel/ configs for your model or disable checkpoint in your config.")
 
-                img_in = torch.ones(2, 4, 96, 96, dtype=torch.float32)
-                t_in = torch.ones(2, dtype=torch.int64)
-                context = torch.ones(2, 77, 1024, dtype=torch.float32)
+                img_in = torch.ones(2, 4, 96, 96, dtype=torch.float32, device=torch.device("cuda"))
+                t_in = torch.ones(2, dtype=torch.int64, device=torch.device("cuda"))
+                context = torch.ones(2, 77, 1024, dtype=torch.float32, device=torch.device("cuda"))
                 scripted_unet = torch.jit.trace(unet, (img_in, t_in, context))
                 scripted_unet = torch.jit.optimize_for_inference(scripted_unet)
                 print(type(scripted_unet))
                 model.model.scripted_diffusion_model = scripted_unet
 
                 # get Decoder for first stage model scripted
-                samples_ddim = torch.ones(1, 4, 96, 96, dtype=torch.float32)
+                samples_ddim = torch.ones(1, 4, 96, 96, dtype=torch.float32, device=torch.device("cuda"))
                 scripted_decoder = torch.jit.trace(decoder, (samples_ddim))
                 scripted_decoder = torch.jit.optimize_for_inference(scripted_decoder)
                 print(type(scripted_decoder))
                 model.first_stage_model.decoder = scripted_decoder
 
-        prompts = data[0]
+        prompts = opt.prompts
         print("Running a forward pass to initialize optimizations")
         uc = None
         if opt.scale != 1.0:
-            uc = model.get_learned_conditioning(batch_size * [""])
+            uc = clip.forward(batch_size * [""])
         if isinstance(prompts, tuple):
             prompts = list(prompts)
 
         with torch.no_grad(), additional_context:
             for _ in range(3):
-                c = model.get_learned_conditioning(prompts)
+                c = clip.forward(prompts)
             samples_ddim, _ = sampler.sample(S=5,
                                              conditioning=c,
                                              batch_size=batch_size,
@@ -330,8 +342,8 @@ def main(opt):
         model.ema_scope():
             uc = None
             if opt.scale != 1.0:
-                uc = model.get_learned_conditioning(batch_size * [""])
-            c = model.get_learned_conditioning(batch_size * [opt.prompt])
+                uc = clip.forward(batch_size * [""]).to(torch.float16)
+            c = clip.forward(batch_size * [opt.prompt]).to(torch.float16)
             shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
             samples, _ = sampler.sample(S=opt.steps,
                                         conditioning=c,

@@ -116,7 +116,7 @@ class ResnetBlock(nn.Module):
                                              out_channels,
                                              device=device)
         self.norm2 = Normalize(out_channels, device=device, tensors=dict_key(state_dict, "norm2."))
-        self.dropout = torch.nn.Dropout(dropout)
+        self.dropout = torch.nn.Identity() if dropout == 0 else torch.nn.Dropout(dropout)
         self.conv2 = Conv2d(out_channels,
                             out_channels,
                             kernel_size=3,

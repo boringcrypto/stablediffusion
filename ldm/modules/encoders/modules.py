@@ -101,12 +101,18 @@ class FrozenCLIPEmbedder(AbstractEncoder):
                  freeze=True, layer="last", layer_idx=None,
                  state_dict=None
                  ):  # clip-vit-base-patch32
+        
+        # record start time
+        import time
+        self.start_time = time.time()
+
         super().__init__()
         assert layer in self.LAYERS
         self.tokenizer = CLIPTokenizer.from_pretrained(version, local_files_only=True)
         download = False
         if (download):
             self.transformer = CLIPTextModel.from_pretrained(version, local_files_only=True)
+            self.transformer.half()
             self.transformer.save_pretrained("models/clip")
         else:
             self.transformer = CLIPTextModel.from_pretrained("models/clip")
@@ -121,6 +127,9 @@ class FrozenCLIPEmbedder(AbstractEncoder):
         if layer == "hidden":
             assert layer_idx is not None
             assert 0 <= abs(layer_idx) <= 12
+
+        # print time elapsed
+        print("Time elapsed for frozen clip: ", time.time() - self.start_time)
 
     def freeze(self):
         self.transformer = self.transformer.eval()
@@ -194,12 +203,14 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
     ]
 
     def __init__(self, arch="ViT-H-14", version="laion2b_s32b_b79k", device="cuda", max_length=77,
-                 freeze=True, layer="last"):
+                 freeze=True, layer="last", state_dict=None):
         super().__init__()
         assert layer in self.LAYERS
         model, _, _ = open_clip.create_model_and_transforms(arch, device=torch.device('cpu'), pretrained=version)
         del model.visual
         self.model = model
+        self.model.half()
+        self.model.to(torch.device("cuda"))
 
         self.device = device
         self.max_length = max_length

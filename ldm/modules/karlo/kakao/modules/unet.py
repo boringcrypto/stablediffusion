@@ -179,7 +179,7 @@ class ResBlock(TimestepBlock):
                 self.out_channels, swish=0.0 if use_scale_shift_norm else 1.0
             ),
             nn.SiLU() if use_scale_shift_norm else nn.Identity(),
-            nn.Dropout(p=dropout),
+            nn.Identity() if dropout == 0 else nn.Dropout(dropout),
             zero_module(
                 conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
             ),
@@ -281,7 +281,7 @@ class ResBlockNoTimeEmbedding(nn.Module):
 
         self.out_layers = nn.Sequential(
             normalization(self.out_channels, swish=1.0),
-            nn.Dropout(p=dropout),
+            nn.Identity() if dropout == 0 else nn.Dropout(dropout),
             zero_module(
                 conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
             ),
